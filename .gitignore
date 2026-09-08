@@ -1,0 +1,26 @@
+# --- Python ------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+.venv/
+
+# --- Caches d'outillage ------------------------------------------------------
+.ruff_cache/
+.pytest_cache/
+
+# --- Secrets et config locale ------------------------------------------------
+# .env contient parfois une cle d'API : il ne doit JAMAIS etre commite.
+# Le modele a copier est .env.example, qui ne contient aucune valeur.
+.env
+
+# --- Etat local du lanceur ---------------------------------------------------
+# PID du backend natif, pour que `assistant-vocal down` sache quoi arreter.
+.assistant/
+
+# --- Echappatoires Docker ----------------------------------------------------
+# Surcharge locale de compose.yaml (par exemple pour patcher l'UI de demo).
+compose.override.yaml
+# Copie locale de l'UI de demo, recuperee par `assistant-vocal fetch-demo`.
+vendor/
+
+# --- macOS -------------------------------------------------------------------
+.DS_Store

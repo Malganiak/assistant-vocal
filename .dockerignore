@@ -1,0 +1,27 @@
+# Ce qui ne doit pas partir dans le contexte de construction de l'image du
+# moteur (docker/backend.Dockerfile, contexte `.`).
+#
+# L'image de l'UI, elle, se construit depuis une URL git : son contexte ne vient
+# pas du disque local et ce fichier ne la concerne pas.
+
+# Un venv macOS ne sert a rien dans une image Linux, et pese lourd.
+.venv/
+__pycache__/
+*.py[cod]
+
+.git/
+.github/
+
+.ruff_cache/
+.pytest_cache/
+
+# Les secrets n'entrent JAMAIS dans une image : compose injecte le .env au
+# moment de l'execution, pas au moment de la construction.
+.env
+
+.assistant/
+vendor/
+compose.override.yaml
+tests/
+docs/
+.DS_Store

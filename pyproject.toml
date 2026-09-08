@@ -1,0 +1,56 @@
+[project]
+name = "assistant-vocal"
+version = "0.1.0"
+description = "Assistant vocal francophone : configure et lance speech-to-speech de Hugging Face."
+readme = "README.md"
+requires-python = ">=3.13,<3.14"
+authors = [{ name = "Leo Hoareau" }]
+
+dependencies = [
+    # La bibliotheque qui fait tout le travail : VAD, transcription, LLM, synthese.
+    # On epingle la version majeure parce que ce projet pose trois rustines sur
+    # des details internes du paquet -- voir src/assistant_vocal/patches.py.
+    "speech-to-speech>=1.0.0,<2",
+    # Lecture du .env et validation des reglages. pydantic lui-meme arrive deja
+    # avec speech-to-speech : seul pydantic-settings s'ajoute.
+    "pydantic-settings>=2.7,<3",
+]
+
+# Aucun "extra" a installer pour Parakeet ni Qwen3-TTS. Sur macOS, tout le stack
+# MLX (mlx, mlx-audio, mlx-lm, mlx-metal) est dans les dependances de BASE de
+# speech-to-speech, conditionnees par le marqueur `platform_system == "Darwin"`.
+# Sur Linux, ce sont nano-parakeet et faster-qwen3-tts[ggml] qui arrivent, par le
+# meme mecanisme. Il n'y a donc rien a choisir ici.
+
+[project.scripts]
+assistant-vocal = "assistant_vocal.cli:main"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "ruff>=0.9",
+]
+
+[build-system]
+requires = ["uv_build>=0.12.5,<0.13.0"]
+build-backend = "uv_build"
+
+# --- ruff : lint et formatage ------------------------------------------------
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+# Selection volontairement courte. Pas de ANN (on n'utilise pas mypy), pas de
+# TRY / EM / PL : ce sont les regles qui produisent le plus de bruit pour le
+# moins de bugs evites.
+select = ["E", "W", "F", "I", "UP", "B", "SIM", "RUF"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["assistant_vocal"]
+
+# --- pytest ------------------------------------------------------------------
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"

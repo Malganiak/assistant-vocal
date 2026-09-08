@@ -1,0 +1,230 @@
+# Orchestration du projet.
+#
+# On ne lance pas ce fichier a la main : `uv run assistant-vocal up` choisit le
+# profil selon la plateforme et affiche la commande docker exacte qu'il execute.
+#
+#   profil `ui`   L'UI de demo seule, en conteneur. Le moteur d'inference tourne
+#                 en NATIF, via uv. C'est le mode macOS : Docker Desktop fait
+#                 tourner une VM Linux SANS acces a Metal, et le handler de
+#                 synthese choisit son moteur en dur sur le nom de la
+#                 plateforme. Dans un conteneur, il basculerait donc sur le
+#                 chemin Linux en CPU pur -- un ordre de grandeur trop lent.
+#
+#   profil `gpu`  L'UI et le moteur d'inference, tous deux en conteneur.
+#                 Linux ou Windows/WSL2, avec un GPU NVIDIA.
+#
+# Les limites par plateforme sont expliquees dans docs/DOCKER.md.
+
+name: assistant-vocal
+
+services:
+  # ===========================================================================
+  # UI de demo -- en conteneur sur TOUTES les plateformes.
+  #
+  # Le contexte de build est le depot amont lui-meme, epingle au tag v1.0.0,
+  # sous-dossier demo/. Rien n'est copie dans ce depot : la seule chose a
+  # maintenir, c'est le numero de tag ci-dessous.
+  #
+  #   tag v1.0.0 -> objet de tag 3914b2cda09a4ac59ecdf6f3324f2a06fe1bd896
+  #              -> commit       16d7f98ff712fb082d53497937f5456667c84680
+  #
+  # (`v1.0.0` est un tag ANNOTE : `git ls-remote --tags` renvoie le SHA de
+  # l'objet de tag, pas celui du commit. C'est le premier qu'il faut comparer.)
+  #
+  # Aucun GPU, aucun modele : c'est un serveur FastAPI qui sert des fichiers
+  # statiques et deux proxys. L'image se construit nativement en arm64 sur un
+  # Mac, sans emulation.
+  #
+  # POURQUOI ON N'UTILISE PAS LE DOCKERFILE AMONT
+  #
+  # Celui du depot a une premiere etape `node:24-slim` qui fait un
+  # `npm ci --omit=dev` dont il n'extrait qu'UN SEUL fichier : le paquet
+  # navigateur de @openai/agents-realtime. Or ce `npm ci` ne passe pas depuis
+  # l'exterieur de Hugging Face : leur `package-lock.json` resout ses 106
+  # paquets depuis `npm.registries.huggingface.tech`, leur registre interne, et
+  # leur `.npmrc` ajoute `min-release-age=7`. Constate ici : la commande reste
+  # bloquee sans fin, sans message.
+  #
+  # On reecrit donc l'etape de construction pour recuperer ce seul fichier
+  # depuis un CDN public, a la version EXACTE que leur verrou epingle (0.14.3).
+  # Verifie : le fichier servi par jsdelivr est identique a l'octet pres
+  # (4 812 462 octets) a celui que produit `npm ci`. Le reste de l'image est
+  # identique a l'amont. Benefice secondaire : plus d'etape node du tout, donc
+  # une construction en une minute au lieu de dix.
+  # ===========================================================================
+  ui:
+    profiles: ["ui", "gpu"]
+    build:
+      context: https://github.com/huggingface/speech-to-speech.git#v1.0.0:demo
+      dockerfile_inline: |
+        FROM python:3.11-slim
+        WORKDIR /app
+
+        # Les dependances d'abord : cette couche est mise en cache
+        # independamment du code de la demo.
+        COPY requirements.txt .
+        RUN pip install --no-cache-dir -r requirements.txt
+
+        COPY . .
+
+        # Le paquet navigateur de l'agent temps reel, que index.html charge par
+        # <script src="vendor/openai-realtime-agents.umd.js">. On telecharge
+        # avec l'interpreteur deja present plutot que d'installer curl.
+        RUN mkdir -p vendor && python -c "\
+        import urllib.request; \
+        urllib.request.urlretrieve( \
+            'https://cdn.jsdelivr.net/npm/@openai/agents-realtime@0.14.3/dist/bundle/openai-realtime-agents.umd.js', \
+            'vendor/openai-realtime-agents.umd.js')"
+
+        EXPOSE 7860
+        CMD ["uvicorn", "server:app", "--host", "0.0.0.0", "--port", "7860"]
+    image: assistant-vocal-ui:s2s-v1.0.0
+
+    # 127.0.0.1 et non 0.0.0.0, pour deux raisons cumulees : l'UI n'a aucune
+    # authentification, et les navigateurs reservent l'acces au micro aux
+    # origines sures (localhost ou HTTPS). L'ouvrir sur le reseau local
+    # n'apporterait donc rien, et exposerait la demo.
+    ports:
+      - "127.0.0.1:7860:7860"
+
+    environment:
+      # --- LE point delicat --------------------------------------------------
+      # Cette URL est composee par le NAVIGATEUR, puisque le transport par
+      # defaut est le WebSocket. Le navigateur tourne sur l'hote, pas dans le
+      # conteneur : il lui faut donc l'adresse vue depuis l'hote.
+      # `localhost:8765` est correct dans LES DEUX profils -- moteur natif sur
+      # 127.0.0.1:8765, ou conteneur `backend` qui publie 8765 sur 127.0.0.1.
+      # `host.docker.internal` serait FAUX ici : le navigateur ne resout pas ce
+      # nom, la connexion n'arriverait jamais, et le moteur ne journaliserait
+      # rien du tout.
+      SPEECH_TO_SPEECH_URL: ${VOICE_S2S_URL:-ws://localhost:8765/v1/realtime}
+
+      # `${VAR-defaut}` SANS les deux-points, volontairement : la demo traite
+      # une valeur vide comme « pas de message d'accueil ». Avec `${VAR:-...}`,
+      # on ne pourrait jamais transmettre le vide.
+      STARTUP_GREETING: ${VOICE_STARTUP_GREETING-Commence par une salutation breve et naturelle, en francais, en une phrase.}
+
+      # Recherche web, optionnelle. Vide = l'outil est masque dans l'UI.
+      SERPER_API_KEY: ${SERPER_API_KEY:-}
+
+      # Serveurs ICE. Utiles seulement en WebRTC hors reseau local.
+      RTC_ICE_SERVERS: ${RTC_ICE_SERVERS:-}
+
+      # On ne definit VOLONTAIREMENT ni LOAD_BALANCER_URL, ni SPACE_ID, ni
+      # LB_HF_TOKEN : les poser basculerait la demo en mode repartiteur de
+      # charge (file d'attente, quotas, connexion Hugging Face obligatoire).
+      # Rien de tout cela n'a de sens en local.
+
+    # Cree le nom `host.docker.internal` sous Linux, ou il n'existe pas par
+    # defaut. Sans effet sur Docker Desktop, qui le fournit deja. Utile
+    # uniquement si l'on bascule sur le transport WebRTC.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+    # python:3.11-slim n'a ni curl ni wget : on sonde avec l'interpreteur.
+    # /api/config est un GET sans authentification, et urlopen leve sur tout
+    # code different de 2xx -- le code de sortie suffit donc.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:7860/api/config', timeout=3)
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+    # `required: false` est INDISPENSABLE. Sans lui, n'activer que le profil
+    # `ui` rend le fichier ENTIER invalide :
+    #     service "ui" depends on undefined service "backend"
+    #
+    # `service_started` et non `service_healthy` : c'est le lanceur qui possede
+    # l'attente de disponibilite, pour pouvoir afficher la progression du
+    # chargement des modeles et detecter un plantage precoce. Avec
+    # `service_healthy`, la commande resterait muette pendant de longues
+    # minutes. Ce que ce `depends_on` conserve d'utile : l'arret se fait dans
+    # l'ordre inverse, donc l'UI part avant le moteur.
+    depends_on:
+      backend:
+        condition: service_started
+        required: false
+
+  # ===========================================================================
+  # Moteur d'inference -- profil `gpu` uniquement (Linux ou WSL2 + NVIDIA).
+  #
+  # On construit notre propre image plutot que de reutiliser celle du depot
+  # amont, pour deux raisons : l'image amont n'installe que ses propres
+  # dependances (sans pydantic-settings), ce qui imposerait un second mecanisme
+  # de configuration cote conteneur ; et le tag amont n'embarque pas de
+  # `uv.lock`, donc deux constructions a deux dates differentes ne donnent pas
+  # le meme resultat. Avec notre lock, elles le donnent.
+  # ===========================================================================
+  backend:
+    profiles: ["gpu"]
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    image: assistant-vocal-backend:0.1.0
+
+    # Le meme `.env` que le mode natif configure le conteneur : une seule source
+    # de verite. `required: false` parce que le `.env` est facultatif.
+    env_file:
+      - path: .env
+        required: false
+
+    environment:
+      # Ecrase ce que dirait le .env : dans un conteneur, ecouter sur la boucle
+      # locale rendrait le service injoignable. Le port n'est publie que sur
+      # 127.0.0.1 de l'hote, ci-dessous.
+      VOICE_HOST: "0.0.0.0"
+      HF_HOME: /root/.cache/huggingface
+      # Utile si un depot de poids ferme entrait un jour dans la configuration.
+      # Les modeles par defaut ne le sont pas.
+      HF_TOKEN: ${HF_TOKEN:-}
+
+    volumes:
+      # Cache Hugging Face de l'hote. Sans ce montage, chaque `down` ferait
+      # retelecharger l'integralite des poids.
+      #
+      # La valeur par defaut n'est PAS decorative : Compose valide aussi les
+      # services NON selectionnes. Une source qui s'interpolerait en chaine
+      # vide casserait le fichier entier -- donc y compris le profil `ui`, donc
+      # y compris sous Windows ou $HOME n'existe pas. `assistant-vocal up`
+      # exporte de toute facon VOICE_HF_CACHE, calcule en Python.
+      - ${VOICE_HF_CACHE:-~/.cache/huggingface}:/root/.cache/huggingface
+
+      # Notre code, en lecture seule. Le projet est installe en mode editable
+      # dans l'image : modifier src/ ne demande donc aucune reconstruction,
+      # un `docker compose restart backend` suffit.
+      - ./src:/app/src:ro
+
+    ports:
+      # 127.0.0.1 : l'API temps reel n'a AUCUNE authentification. Le port doit
+      # malgre tout etre publie, car c'est le navigateur de l'hote qui ouvre la
+      # connexion WebSocket.
+      - "127.0.0.1:8765:8765"
+
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: ["gpu"]
+
+    healthcheck:
+      # Le port n'ouvre qu'APRES le chargement des modeles : les handlers
+      # chargent leurs poids dans leur constructeur, et le pipeline est bati
+      # avant que le serveur HTTP n'ecoute. « sain » signifie donc « pipeline
+      # pret ». D'ou le start_period enorme : le premier demarrage telecharge
+      # une dizaine de gigaoctets de poids.
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/v1/pool', timeout=5)
+      interval: 15s
+      timeout: 10s
+      retries: 4
+      start_period: 1800s
