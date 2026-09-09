@@ -1,0 +1,65 @@
+# Ce que `make check` fait en local, sur chaque poussee.
+#
+# Deux jobs, parce que les deux verifications n'ont pas les memes besoins :
+#
+#   check    macOS ARM, parce que `tests/test_patches.py` importe
+#            `speech_to_speech`, dont les dependances de base sont le stack MLX
+#            sous le marqueur `platform_system == "Darwin"`. C'est la plateforme
+#            que le projet cible : la tester ailleurs ne prouverait rien.
+#   compose  Ubuntu, parce que `docker compose config` a besoin de la CLI docker
+#            (pas du daemon) et qu'elle est absente des runners macOS.
+#
+# Aucun modele n'est telecharge : les tests ne chargent rien et n'ouvrent pas de
+# micro. C'est la discipline d'import de config.py et emotions.py qui le permet.
+
+name: CI
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Lint et tests (macOS ARM)
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Installer uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      # `.python-version` fixe la version : uv la respecte sans qu'on la repete
+      # ici. Un seul endroit ou la changer.
+      - name: Installer les dependances
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Formatage
+        run: uv run ruff format --check .
+
+      - name: Tests
+        run: uv run pytest
+
+  compose:
+    name: Validation de compose.yaml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Les deux profils, parce qu'une erreur dans l'un ne se voit pas depuis
+      # l'autre : `ui` est le chemin macOS, `gpu` le chemin Linux+NVIDIA.
+      - name: Profil ui
+        run: COMPOSE_PROFILES=ui docker compose config -q
+
+      - name: Profil gpu
+        run: COMPOSE_PROFILES=gpu docker compose config -q
