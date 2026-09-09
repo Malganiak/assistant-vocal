@@ -17,7 +17,44 @@ from collections.abc import Iterator
 
 import pytest
 
+from assistant_vocal.config import Settings
 from assistant_vocal.tts_handler import filtrer_sur_signature, parametres_acceptes
+
+
+class _NomDeModeleSeul:
+    """Le strict minimum que `_infer_model_type_from_name` lit sur `self`."""
+
+    gguf_talker_path = None
+
+    def __init__(self, model_name: str) -> None:
+        self.model_name = model_name
+
+
+def test_sentinelle_type_de_modele_accorde_avec_la_bibliotheque():
+    """SENTINELLE : notre lecture du nom de modele doit rester celle de l'amont.
+
+    `Settings.type_de_modele` reproduit `_infer_model_type_from_name`, et c'est
+    sur cette deduction que repose la validation du clonage : si l'amont changeait
+    l'ordre de ses tests ou ses mots-cles, nous accepterions au demarrage une
+    combinaison que la bibliotheque traiterait autrement -- et le symptome serait
+    un silence a chaque replique, l'exception etant avalee par son `process()`.
+
+    Ce test transforme cette divergence en echec au `pytest`.
+    """
+    from speech_to_speech.TTS.qwen3_tts_handler import Qwen3TTSHandler
+
+    noms = [
+        "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
+        "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
+        "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit",
+        "mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign",
+        "Qwen/Qwen3-TTS-12Hz-0.6B-Base",
+        "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+    ]
+    for nom in noms:
+        amont = Qwen3TTSHandler._infer_model_type_from_name(_NomDeModeleSeul(nom))
+        assert Settings(tts_model=nom).type_de_modele == amont, nom
+
 
 # ---------------------------------------------------------------------------
 # Filtre de signature

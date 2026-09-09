@@ -17,10 +17,12 @@ from pydantic import ValidationError
 
 from assistant_vocal.config import (
     SPEAKERS,
+    VOIX_PATH,
     Settings,
     build_pipeline_args,
     inject_tts_gen_kwargs,
     read_prompt,
+    read_ref_text,
     tts_gen_kwargs,
 )
 
@@ -37,8 +39,93 @@ def test_defauts_sans_env():
     assert settings.tts_speaker == "aiden"
     assert settings.tts_language == "fr"
     assert settings.host == "127.0.0.1"
-    assert settings.emotions is True
     assert settings.allow_ui_prompt is False
+    # Le defaut est le CLONAGE, donc un checkpoint Base, donc pas d'emotions :
+    # le chemin de clonage ne transmet jamais `instruct`.
+    assert settings.tts_model == "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit"
+    assert settings.emotions is False
+
+
+# ---------------------------------------------------------------------------
+# Clonage de voix
+# ---------------------------------------------------------------------------
+
+
+def test_le_defaut_est_le_clonage_avec_la_voix_livree():
+    """La voix francaise du paquet doit marcher sans aucune configuration."""
+    settings = Settings()
+    assert settings.type_de_modele == "base"
+    assert settings.clonage_actif is True
+    assert settings.ref_audio_path == VOIX_PATH
+    assert settings.ref_audio_path.exists(), "la voix de reference doit etre livree"
+    assert settings.ref_text == read_ref_text()
+    assert settings.ref_text, "la transcription de reference ne peut pas etre vide"
+
+
+@pytest.mark.parametrize(
+    ("modele", "attendu"),
+    [
+        ("mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit", "base"),
+        ("mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16", "base"),
+        ("mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit", "custom_voice"),
+        ("mlx-community/Qwen3-TTS-12Hz-1.7B-VoiceDesign", "voice_design"),
+        ("Qwen/Qwen3-TTS-12Hz-0.6B-Base", "base"),
+    ],
+)
+def test_type_de_modele_deduit_du_nom(modele: str, attendu: str):
+    """Un seul reglage decide du mode : il n'y a pas deux boutons a accorder."""
+    assert Settings(tts_model=modele).type_de_modele == attendu
+
+
+def test_reference_sur_un_checkpoint_sans_clonage_est_refusee():
+    """Le piege le plus couteux : il se traduirait par un silence a chaque replique.
+
+    Le handler voit une reference, prend le chemin de clonage, appelle
+    `generate()` sans locuteur -- et `generate()` sur un CustomVoice en exige un.
+    L'exception est avalee par la bibliotheque.
+    """
+    with pytest.raises(ValidationError) as capture:
+        Settings(
+            tts_model="mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit",
+            tts_ref_audio=str(VOIX_PATH),
+            tts_ref_text="peu importe",
+        )
+    assert "ne sait pas cloner" in str(capture.value)
+
+
+def test_audio_de_reference_introuvable_est_refuse_au_demarrage():
+    with pytest.raises(ValidationError) as capture:
+        Settings(tts_ref_audio="/nexiste/pas.wav", tts_ref_text="peu importe")
+    assert "introuvable" in str(capture.value)
+
+
+def test_audio_et_transcription_vont_par_paire():
+    """Un audio sans sa transcription exacte desaligne le clonage."""
+    with pytest.raises(ValidationError) as capture:
+        Settings(tts_ref_audio=str(VOIX_PATH))
+    assert "PAIRE" in str(capture.value)
+
+    with pytest.raises(ValidationError) as capture:
+        Settings(tts_ref_text="une transcription orpheline")
+    assert "PAIRE" in str(capture.value)
+
+
+def test_le_clonage_ne_passe_aucun_locuteur():
+    """`--qwen3_tts_speaker` n'a aucun effet en clonage : ne pas le passer."""
+    args = build_pipeline_args(Settings(), "local", mac_preset=True)
+    assert "--qwen3_tts_ref_audio" in args
+    assert "--qwen3_tts_ref_text" in args
+    assert "--qwen3_tts_speaker" not in args
+    # Le nom est passe avec son suffixe : sans lui, `_resolve_mlx_model_name`
+    # completerait en `-6bit`, une variante qui n'existe pas pour Base.
+    assert "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit" in args
+
+
+def test_sans_clonage_le_locuteur_revient():
+    settings = Settings(tts_model="mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit")
+    args = build_pipeline_args(settings, "local", mac_preset=True)
+    assert "--qwen3_tts_speaker" in args
+    assert "--qwen3_tts_ref_audio" not in args
 
 
 def test_locuteur_inconnu_est_refuse():

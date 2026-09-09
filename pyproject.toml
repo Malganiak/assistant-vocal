@@ -5,6 +5,8 @@ description = "Assistant vocal francophone : configure et lance speech-to-speech
 readme = "README.md"
 requires-python = ">=3.13,<3.14"
 authors = [{ name = "Leo Hoareau" }]
+license = "MIT"
+license-files = ["LICENSE"]
 
 dependencies = [
     # La bibliotheque qui fait tout le travail : VAD, transcription, LLM, synthese.

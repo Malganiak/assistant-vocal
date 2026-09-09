@@ -14,7 +14,7 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal
 
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from assistant_vocal import AssistantError
@@ -40,13 +40,34 @@ SPEAKERS: tuple[str, ...] = (
 #: sans se battre avec les echappements.
 PROMPT_PATH = Path(__file__).with_name("prompt_fr.txt")
 
+#: La voix de reference du clonage, livree avec le paquet. Meme raisonnement que
+#: pour le prompt : un fichier a cote du module, pas une ressource a aller
+#: chercher ailleurs. `uv_build` embarque tout le contenu de src/assistant_vocal.
+#:
+#: Le clonage a besoin des DEUX : l'audio, et sa transcription EXACTE. Une
+#: transcription approximative degrade la voix produite, parce que le modele
+#: aligne le texte de reference sur l'audio de reference pour en deduire le
+#: timbre. C'est aussi pour ca que les deux fichiers portent le meme nom.
+VOIX_PATH = Path(__file__).with_name("voix_francaise.wav")
+VOIX_TEXTE_PATH = Path(__file__).with_name("voix_francaise.txt")
+
+#: Les trois familles de checkpoints Qwen3-TTS, et ce que chacune sait faire.
+#: On deduit la famille du NOM du modele, exactement comme le fait la
+#: bibliotheque dans `_infer_model_type_from_name`. Un seul reglage decide donc
+#: du mode de synthese : il n'y a pas deux boutons a garder coherents.
+#:
+#:   base          clonage de voix, a partir d'un audio de reference
+#:   custom_voice  un des neuf locuteurs predefinis
+#:   voice_design  une voix decrite en langage naturel
+TypeDeModele = Literal["base", "custom_voice", "voice_design"]
+
 #: Les depots de poids utilises en mode local sur Apple Silicon. Le prereglage
 #: `--mac-optimal-settings` et les defauts des handlers les choisissent sans
 #: qu'on ait a les nommer ; on les liste ici pour que `doctor` puisse verifier
 #: qu'ils sont bien en cache, et pour que le README n'ait pas a deviner.
 MODELES_LOCAUX: dict[str, str] = {
     "transcription": "mlx-community/parakeet-tdt-0.6b-v3",
-    "synthese": "mlx-community/Qwen3-TTS-12Hz-1.7B-CustomVoice-6bit",
+    "synthese": "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
     "fin de tour": "pipecat-ai/smart-turn-v3",
 }
 
@@ -76,10 +97,33 @@ class Settings(BaseSettings):
     api_base_url: str = ""
     api_key: str = ""
 
-    # --- Langue, voix ---------------------------------------------------------
+    # --- Langue ---------------------------------------------------------------
     stt_language: str = "fr"
-    tts_speaker: str = "aiden"
     tts_language: str = "fr"
+
+    # --- Synthese : quel modele, donc quel mode de voix -----------------------
+    # Le checkpoint Base est le SEUL des trois qui sache cloner une voix. C'est
+    # ce qui permet d'avoir une voix reellement francaise : aucun des neuf
+    # locuteurs de CustomVoice n'est natif du francais (serena et vivian sont
+    # chinoises, ono_anna japonaise, sohee coreenne, aiden et ryan anglaises), et
+    # la documentation amont recommande d'utiliser chaque locuteur dans SA langue.
+    #
+    # POURQUOI 8bit et pas bf16, mesure a l'appui : les deux produisent le meme
+    # nombre de pas a une unite pres (65 contre 66 sur la meme phrase), donc la
+    # quantification ne change pas le contenu genere. Mais bf16 tourne a RTF
+    # 0,59-0,66 -- PLUS LENT que le temps reel, donc inutilisable pour une
+    # conversation -- quand 8bit tient RTF 1,33-2,59. Et il economise 1,3 Go.
+    tts_model: str = "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit"
+
+    # Vide = la reference livree avec le paquet (VOIX_PATH / VOIX_TEXTE_PATH).
+    # Renseigner les deux ensemble pour utiliser une autre voix : l'audio SANS sa
+    # transcription exacte degrade le resultat.
+    tts_ref_audio: str = ""
+    tts_ref_text: str = ""
+
+    # Locuteur predefini. IGNORE en clonage (le checkpoint Base n'en a aucun) :
+    # il ne sert que si vous repassez sur un checkpoint CustomVoice.
+    tts_speaker: str = "aiden"
 
     # --- Synthese : debit de sortie -------------------------------------------
     # Nombre de pas de codec par paquet audio. Mesure : chaque pas coute environ
@@ -113,10 +157,65 @@ class Settings(BaseSettings):
     block_mic_during_playback: bool = True
 
     # --- Emotions -------------------------------------------------------------
-    emotions: bool = True
+    # false PAR DEFAUT, parce que le clonage de voix et les emotions sont
+    # MUTUELLEMENT EXCLUSIFS -- ce n'est pas un choix de gout, c'est une limite
+    # du modele. Le ton d'une replique se demande par le parametre `instruct`,
+    # or le chemin de clonage ne le transmet jamais : `_process_voice_clone`
+    # passe text, ref_audio, ref_text et lang_code, rien d'autre. mlx-audio est
+    # d'ailleurs explicite ailleurs dans son code : « Qwen3-TTS batch reference
+    # cloning does not support instructs ».
+    #
+    # Ce que false NE desactive PAS : le retrait des etiquettes. `EmotionTracker`
+    # continue de les enlever du texte, et c'est indispensable -- une etiquette
+    # laissee dans le texte se ferait PRONONCER. Seule l'application du ton
+    # s'arrete.
+    #
+    # Repassez-le a true si vous revenez sur un checkpoint CustomVoice.
+    emotions: bool = False
     # true : laisse l'UI de demo imposer son propre prompt systeme. Les
     # etiquettes d'emotion cessent alors d'arriver -- voir patches.py.
     allow_ui_prompt: bool = False
+
+    @property
+    def type_de_modele(self) -> TypeDeModele:
+        """La famille du checkpoint, deduite de son nom.
+
+        Reproduit VOLONTAIREMENT `_infer_model_type_from_name` de la
+        bibliotheque, y compris l'ordre des tests : c'est elle qui decidera du
+        chemin de synthese, et une divergence entre sa lecture et la notre
+        rendrait la validation ci-dessous mensongere.
+        `test_config.py` verifie que les deux restent d'accord.
+        """
+        nom = self.tts_model.lower()
+        if "voicedesign" in nom:
+            return "voice_design"
+        if "customvoice" in nom:
+            return "custom_voice"
+        return "base"
+
+    @property
+    def clonage_actif(self) -> bool:
+        """Vrai quand la synthese clone la voix de reference.
+
+        Seul le checkpoint Base sait le faire ; c'est aussi le seul qui l'exige,
+        puisqu'il n'a aucun locuteur predefini.
+        """
+        return self.type_de_modele == "base"
+
+    @property
+    def ref_audio_path(self) -> Path:
+        """L'audio de reference : celui du paquet, ou celui qu'on a demande."""
+        if not self.tts_ref_audio:
+            return VOIX_PATH
+        # Absolu : `_resolve_audio_path` de la bibliotheque ne cherche qu'au
+        # repertoire courant et a la racine du paquet AMONT. Un chemin relatif
+        # ne serait donc trouve que si l'on lance depuis la racine du depot.
+        return Path(self.tts_ref_audio).expanduser().resolve()
+
+    @property
+    def ref_text(self) -> str:
+        """La transcription de reference : celle du paquet, ou celle demandee."""
+        return self.tts_ref_text or read_ref_text()
 
     @field_validator("tts_speaker")
     @classmethod
@@ -126,6 +225,54 @@ class Settings(BaseSettings):
             raise ValueError(f"locuteur inconnu {valeur!r} ; choisis parmi : {', '.join(SPEAKERS)}")
         return normalise
 
+    @model_validator(mode="after")
+    def _reference_coherente(self) -> Settings:
+        """Refuse au demarrage les combinaisons qui echouent en silence.
+
+        MEME RAISON QUE `_locuteur_connu`, et le meme symptome a eviter : le
+        `process()` de la bibliotheque enveloppe toute la synthese dans un
+        `except Exception` qui journalise « Error during Qwen3-TTS generation ».
+        Une erreur de configuration ne se voit donc PAS -- la replique
+        disparait, sans un son.
+
+        Le piege que ce validateur attrape vraiment : un audio de reference
+        pose sur un checkpoint CustomVoice. Le handler voit une reference, prend
+        le chemin de clonage, appelle `generate()` SANS locuteur -- et
+        `generate()`, sur un CustomVoice, exige un locuteur. Levee, avalee,
+        silence a chaque replique. Rien dans le journal ne pointerait vers la
+        vraie cause.
+        """
+        if self.clonage_actif:
+            if not self.ref_audio_path.exists():
+                raise ValueError(
+                    f"audio de reference introuvable : {self.ref_audio_path}\n"
+                    f"  Le checkpoint {self.tts_model} est un modele Base : il n'a aucun\n"
+                    f"  locuteur predefini et ne peut parler QUE par clonage."
+                )
+            if not self.ref_text.strip():
+                raise ValueError(
+                    "transcription de reference vide. Le clonage aligne le texte de "
+                    "reference sur l'audio de reference : sans elle, la voix produite "
+                    "est degradee."
+                )
+        elif self.tts_ref_audio:
+            raise ValueError(
+                f"VOICE_TTS_REF_AUDIO est renseigne, mais {self.tts_model} n'est pas un\n"
+                f"  modele Base ({self.type_de_modele}) : il ne sait pas cloner une voix.\n"
+                f"  La bibliotheque prendrait quand meme le chemin de clonage et echouerait\n"
+                f"  en silence, une replique perdue sur deux lignes de journal.\n\n"
+                f"  Soit VOICE_TTS_MODEL=mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit,\n"
+                f"  soit laissez VOICE_TTS_REF_AUDIO vide."
+            )
+
+        if bool(self.tts_ref_audio) != bool(self.tts_ref_text):
+            raise ValueError(
+                "VOICE_TTS_REF_AUDIO et VOICE_TTS_REF_TEXT vont par PAIRE. Un audio sans "
+                "sa transcription exacte -- ou l'inverse -- desaligne le clonage et "
+                "degrade la voix. Laissez les deux vides pour la voix livree."
+            )
+        return self
+
 
 def read_prompt() -> str:
     """Le prompt systeme du projet, source unique du depot."""
@@ -133,6 +280,14 @@ def read_prompt() -> str:
         return PROMPT_PATH.read_text(encoding="utf-8").strip()
     except OSError as exc:  # pragma: no cover - ne peut arriver qu'en paquet casse
         raise AssistantError(f"prompt introuvable : {PROMPT_PATH}") from exc
+
+
+def read_ref_text() -> str:
+    """La transcription de la voix de reference livree avec le paquet."""
+    try:
+        return VOIX_TEXTE_PATH.read_text(encoding="utf-8").strip()
+    except OSError as exc:  # pragma: no cover - ne peut arriver qu'en paquet casse
+        raise AssistantError(f"transcription de reference introuvable : {VOIX_TEXTE_PATH}") from exc
 
 
 def tts_gen_kwargs(settings: Settings) -> dict[str, float | int]:
@@ -207,7 +362,24 @@ def build_pipeline_args(
     # --- Synthese -------------------------------------------------------------
     # Un `args +=` par drapeau : chaque ligne garde le drapeau et sa valeur
     # ensemble, ce qui se relit et se modifie sans compter les elements.
-    args += ["--qwen3_tts_speaker", settings.tts_speaker]
+    #
+    # Le nom du modele est passe EXPLICITEMENT, avec son suffixe de
+    # quantification. Deux raisons : `--mac-optimal-settings` ne fixe que des
+    # valeurs par DEFAUT (`parser.set_defaults`), donc un drapeau explicite
+    # gagne ; et surtout, un nom sans suffixe se verrait completer en `-6bit` par
+    # `_resolve_mlx_model_name`, une variante qui n'existe pas pour le
+    # checkpoint Base et qu'il faudrait telecharger.
+    args += ["--qwen3_tts_model_name", settings.tts_model]
+
+    if settings.clonage_actif:
+        # Le chemin de clonage n'utilise AUCUN locuteur : ne pas passer
+        # `--qwen3_tts_speaker` ici evite de laisser croire, dans la sortie de
+        # `doctor`, qu'il aurait un effet.
+        args += ["--qwen3_tts_ref_audio", str(settings.ref_audio_path)]
+        args += ["--qwen3_tts_ref_text", settings.ref_text]
+    else:
+        args += ["--qwen3_tts_speaker", settings.tts_speaker]
+
     args += ["--qwen3_tts_language", settings.tts_language]
     args += ["--qwen3_tts_streaming_chunk_size", str(settings.tts_chunk_size)]
     args += ["--qwen3_tts_max_new_tokens", str(settings.tts_max_tokens)]

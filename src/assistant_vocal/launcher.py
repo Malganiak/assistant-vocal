@@ -63,7 +63,12 @@ class Mode(StrEnum):
 
 
 # ---------------------------------------------------------------------------
-# Sondes : plateforme, Docker, ports
+# Sondes : plateforme, Docker, ports, processus
+#
+# Le bloc « ports, processus » repond a un besoin precis : retrouver et arreter
+# un moteur qu'on ne suit PLUS. Le fichier PID ne suffit pas -- un `up`
+# interrompu brutalement laisse un orphelin vivant et perd sa trace. Le port,
+# lui, ne mente jamais.
 # ---------------------------------------------------------------------------
 
 
@@ -182,23 +187,222 @@ def port_libre(port: int) -> bool:
         return sonde.connect_ex(("127.0.0.1", port)) != 0
 
 
+#: Ce qui identifie NOTRE moteur dans une ligne de commande. `up` ne lance rien
+#: d'autre que `python -m assistant_vocal.cli serve` : ces deux marqueurs
+#: ensemble ne peuvent designer qu'un moteur de ce projet.
+_MARQUEURS_MOTEUR = ("assistant_vocal.cli", "serve")
+
+
+def processus_du_port(port: int) -> tuple[int, str] | None:
+    """Le PID qui ECOUTE sur `port`, avec sa ligne de commande, ou None.
+
+    Pourquoi ne pas se contenter du fichier PID : un `up` interrompu brutalement
+    laisse un moteur orphelin ET perd sa trace, parce que son `finally` n'a pas
+    tourne -- ou a tourne a moitie. Le port, lui, ne mente jamais. C'est la
+    seule source fiable pour retrouver un moteur qu'on ne suit plus.
+    """
+    if os.name != "posix":  # pragma: no cover - branche Windows
+        return _processus_du_port_windows(port)
+
+    if shutil.which("lsof") is None:  # pragma: no cover - lsof est partout sur macOS et Linux
+        return None
+    try:
+        sortie = subprocess.run(
+            ["lsof", "-ti", f":{port}", "-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover
+        return None
+
+    # `lsof -t` peut rendre plusieurs PID (IPv4 et IPv6 du meme serveur). Le
+    # premier suffit : c'est le meme processus.
+    pids = [morceau for morceau in sortie.split() if morceau.isdigit()]
+    if not pids:
+        return None
+    pid = int(pids[0])
+    return pid, ligne_de_commande(pid)
+
+
+def _processus_du_port_windows(port: int) -> tuple[int, str] | None:  # pragma: no cover
+    """Meme service, avec les outils que Windows a d'origine."""
+    try:
+        sortie = subprocess.run(
+            ["netstat", "-ano", "-p", "TCP"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+        ).stdout
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for ligne in sortie.splitlines():
+        morceaux = ligne.split()
+        if len(morceaux) < 5 or morceaux[3] != "LISTENING":
+            continue
+        if morceaux[1].endswith(f":{port}") and morceaux[4].isdigit():
+            pid = int(morceaux[4])
+            return pid, ligne_de_commande(pid)
+    return None
+
+
+def ligne_de_commande(pid: int) -> str:
+    """La commande du processus `pid`, ou une chaine vide si on ne sait pas.
+
+    Elle sert a deux choses : decider si le processus est a nous, et le NOMMER
+    dans le message d'erreur quand il ne l'est pas.
+    """
+    if os.name != "posix":  # pragma: no cover - branche Windows
+        commande = ["wmic", "process", "where", f"ProcessId={pid}", "get", "CommandLine"]
+    else:
+        commande = ["ps", "-p", str(pid), "-o", "command="]
+    try:
+        return subprocess.run(commande, capture_output=True, text=True, timeout=10.0).stdout.strip()
+    except (OSError, subprocess.SubprocessError):  # pragma: no cover
+        return ""
+
+
+def est_notre_moteur(ligne: str) -> bool:
+    """Vrai si cette ligne de commande est un moteur lance par ce projet.
+
+    C'est la garde qui autorise `up` et `down` a tuer sans rien demander. Un
+    serveur tiers qui utiliserait 8765 ne correspond pas, et on n'y touche
+    JAMAIS : on se contente de le nommer dans le message d'erreur.
+    """
+    return all(marqueur in ligne for marqueur in _MARQUEURS_MOTEUR)
+
+
+def pid_vivant(pid: int) -> bool:
+    """Vrai si le processus existe encore."""
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except (PermissionError, OSError):
+        # Il existe, mais il n'est pas a nous. On n'en fera rien, et le dire
+        # vivant est la reponse honnete.
+        return True
+    return True
+
+
+def _signaler(pid: int, numero: int) -> None:
+    """Signale le GROUPE du processus -- sauf si c'est le notre.
+
+    Le moteur est lance avec `start_new_session=True` : il a donc son propre
+    groupe, et signaler le groupe emporte les sous-processus que l'inference
+    aurait essaimes. Mais si le PID retrouve partageait NOTRE groupe, `killpg`
+    nous tuerait avec lui : on retombe alors sur un signal au seul PID.
+    """
+    if os.name != "posix":  # pragma: no cover - branche Windows
+        os.kill(pid, numero)
+        return
+    groupe = os.getpgid(pid)
+    if groupe == os.getpgid(0):
+        os.kill(pid, numero)
+    else:
+        os.killpg(groupe, numero)
+
+
+def arreter_pid(pid: int, *, delai_s: float = 15.0) -> bool:
+    """SIGTERM, puis SIGKILL. Vrai si le processus est bien parti.
+
+    Version « PID nu » de `arreter_backend_natif`, pour les cas ou l'on n'a pas
+    d'objet `Popen` : un moteur orphelin retrouve par son port, ou le pid note
+    par un `up` d'une autre session.
+
+    L'echec du PREMIER signal ne fait PAS abandonner, et c'est le coeur du
+    correctif : la bibliotheque intercepte SIGTERM et peut ne jamais rendre la
+    main. Abandonner la laissait vivante, le port pris.
+    """
+    for numero, delai in ((signal.SIGTERM, delai_s), (signal.SIGKILL, 5.0)):
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            _signaler(pid, numero)
+
+        fin = time.monotonic() + delai
+        while time.monotonic() < fin:
+            if not pid_vivant(pid):
+                return True
+            time.sleep(0.2)
+        if numero is signal.SIGTERM:
+            print("  Pas de reponse a SIGTERM, on force.", file=sys.stderr)
+    return not pid_vivant(pid)
+
+
+def liberer_port_moteur(port: int) -> bool:
+    """Recupere le port si c'est un de NOS moteurs qui le tient.
+
+    Vrai si le port est libre en sortant. Un programme tiers est signale par
+    l'appelant, jamais tue : c'est `est_notre_moteur` qui trace la limite.
+
+    Le delai de grace est court, a dessein : un orphelin n'a plus de session a
+    fermer proprement, et faire attendre quinze secondes a chaque `up` serait
+    payer cher un arret propre qui n'a plus d'objet.
+    """
+    trouve = processus_du_port(port)
+    if trouve is None:
+        return port_libre(port)
+
+    pid, ligne = trouve
+    if not est_notre_moteur(ligne):
+        return False
+
+    print(
+        f"Un moteur de ce projet tient encore le port {port} (pid {pid}) : on l'arrete.",
+        file=sys.stderr,
+    )
+    arreter_pid(pid, delai_s=5.0)
+    if _pid_enregistre() is None:
+        # La trace notee designe un processus mort : elle est perimee.
+        FICHIER_PID.unlink(missing_ok=True)
+    return port_libre(port)
+
+
 def exiger_ports_libres(port_moteur: int) -> None:
     """Echoue tot plutot que de laisser croire que tout va bien.
 
-    C'est aussi ce qui rattrape un moteur orphelin, laisse derriere par un `up`
-    tue brutalement : inutile d'aller fouiller les processus.
+    Avant d'echouer, on RECUPERE le port du moteur. Sans cela, un `up`
+    interrompu brutalement laissait un orphelin, et le message conseillait
+    `assistant-vocal down` -- la seule chose qui ne pouvait pas marcher,
+    puisque le fichier PID avait disparu avec le `up`. Il fallait tuer le
+    processus a la main, `up` apres `up`.
     """
+    if not port_libre(port_moteur):
+        liberer_port_moteur(port_moteur)
+
     for port, quoi in ((port_moteur, "le moteur d'inference"), (PORT_UI, "l'UI de demo")):
         if port_libre(port):
             continue
-        raise AssistantError(
-            f"le port {port} est deja pris, or {quoi} en a besoin.\n\n"
-            "  Soit une instance tourne encore :\n"
-            "      assistant-vocal down\n"
-            "  Soit un autre programme l'utilise :\n"
-            f"      macOS / Linux : lsof -i :{port}\n"
-            f"      Windows       : netstat -ano | findstr {port}"
-        )
+
+        # Nommer le coupable, et dire POURQUOI il n'a pas ete arrete tout seul.
+        # C'est ce qui evite d'avoir a lancer `lsof` soi-meme, et surtout de
+        # relancer `down` en boucle quand ce n'est pas lui qui peut aider.
+        trouve = processus_du_port(port)
+        if trouve is None:
+            detail = (
+                "  Impossible de savoir qui le tient.\n"
+                f"      macOS / Linux : lsof -i :{port}\n"
+                f"      Windows       : netstat -ano | findstr {port}"
+            )
+        else:
+            pid, ligne = trouve
+            detail = f"  Tenu par le pid {pid} :\n      {ligne or '(commande inconnue)'}\n"
+            if est_notre_moteur(ligne):
+                detail += (
+                    "\n  C'est un moteur de ce projet, mais il n'a pas pu etre arrete.\n"
+                    f"      kill -9 {pid}"
+                )
+            elif port == PORT_UI:
+                detail += (
+                    "\n  Ce n'est pas l'UI de ce projet. Un conteneur oublie ?\n      docker ps"
+                )
+            else:
+                detail += (
+                    "\n  Ce n'est pas un moteur de ce projet : on n'y touche pas.\n"
+                    "  Arretez ce programme, ou choisissez un autre port :\n"
+                    "      VOICE_PORT=8766 uv run assistant-vocal up"
+                )
+
+        raise AssistantError(f"le port {port} est deja pris, or {quoi} en a besoin.\n\n{detail}")
 
 
 def attendre_http(
@@ -300,31 +504,24 @@ def arreter_backend_natif(proc: subprocess.Popen[str], *, delai_s: float = 15.0)
     d'execution : les handlers vident leurs files et rendent la memoire du GPU.
     On signale le GROUPE et pas seulement le PID : si l'inference a essaime un
     sous-processus, il part avec.
+
+    L'echec du premier signal ne fait plus abandonner. Un `return` a cet endroit
+    laissait un moteur bien vivant, et le `finally` de `up` effacait ensuite son
+    pid : port pris, plus aucune trace, et `down` sans prise dessus.
     """
     if proc.poll() is not None:
         return
 
     print("Arret du moteur d'inference...", file=sys.stderr)
-    try:
-        if os.name == "posix":
-            os.killpg(os.getpgid(proc.pid), signal.SIGTERM)
-        else:
-            proc.terminate()
-    except (ProcessLookupError, PermissionError, OSError):
-        return
-
-    try:
-        proc.wait(timeout=delai_s)
-    except subprocess.TimeoutExpired:
-        print("Le moteur ne repond pas, on force.", file=sys.stderr)
-        try:
-            if os.name == "posix":
-                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-            else:
-                proc.kill()
-            proc.wait(timeout=5.0)
-        except (ProcessLookupError, PermissionError, OSError, subprocess.TimeoutExpired):
-            pass
+    if not arreter_pid(proc.pid, delai_s=delai_s):
+        print(
+            f"  Le moteur (pid {proc.pid}) resiste. Son pid reste note :\n"
+            "  `assistant-vocal down` le reprendra, par son pid ou par son port.",
+            file=sys.stderr,
+        )
+    # Recolter le zombie, pour que `proc.poll()` dise la verite juste apres.
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=1.0)
 
 
 # ---------------------------------------------------------------------------
@@ -477,7 +674,13 @@ def up(settings: Settings, *, force_mode: str | None = None, rebuild: bool = Fal
         compose("down", "--remove-orphans", profil="*", strict=False)
         if backend is not None:
             arreter_backend_natif(backend)
-        FICHIER_PID.unlink(missing_ok=True)
+        # On effacait le fichier PID SANS regarder si le moteur etait vraiment
+        # parti. Un moteur qui survit a son arret perdait donc sa trace, et
+        # `down` n'avait plus rien pour le retrouver : le port restait pris
+        # jusqu'a un `kill` a la main. On ne l'efface plus que s'il n'y a
+        # effectivement plus rien a suivre.
+        if backend is None or backend.poll() is not None:
+            FICHIER_PID.unlink(missing_ok=True)
 
     return 0
 
@@ -485,20 +688,35 @@ def up(settings: Settings, *, force_mode: str | None = None, rebuild: bool = Fal
 def down() -> int:
     """Filet de securite : arrete ce qui traine encore.
 
+    DEUX chemins, dans cet ordre, parce que le premier peut manquer :
+
+      1. le pid note par `up` ;
+      2. le PORT, qui ne mente jamais.
+
+    Le second est le filet qui manquait. Sans lui, un moteur orphelin dont le
+    fichier PID avait disparu ne pouvait etre arrete que par un `kill` a la
+    main -- alors que `up` conseillait precisement `down`.
+
     Fonctionne meme daemon eteint : le moteur natif est arrete d'abord, et
     l'echec de la partie Docker est signale sans faire echouer la commande.
     """
     pid = _pid_enregistre()
     if pid is not None:
         print(f"Arret du moteur natif laisse derriere (pid {pid}).", file=sys.stderr)
-        try:
-            if os.name == "posix":
-                os.killpg(os.getpgid(pid), signal.SIGTERM)
-            else:  # pragma: no cover - branche Windows
-                os.kill(pid, signal.SIGTERM)
-        except (ProcessLookupError, PermissionError, OSError):
-            print("  Il n'existe plus.", file=sys.stderr)
+        if arreter_pid(pid):
+            FICHIER_PID.unlink(missing_ok=True)
+        else:
+            # Ne PAS effacer la trace d'un processus encore vivant : c'est
+            # exactement ce qui le rendait introuvable au `down` suivant.
+            print(
+                f"  Le pid {pid} n'a pas pu etre arrete ; sa trace est conservee.",
+                file=sys.stderr,
+            )
+    elif FICHIER_PID.exists():
+        # Le fichier designe un processus mort : trace perimee, on la retire.
         FICHIER_PID.unlink(missing_ok=True)
+
+    _liberer_le_port_du_moteur()
 
     # `down` doit rester utile meme sans Docker : le moteur natif, lui, vient
     # d'etre arrete. On ne fait donc pas echouer la commande pour autant.
@@ -517,17 +735,54 @@ def down() -> int:
     return 0
 
 
+def _liberer_le_port_du_moteur() -> None:
+    """Le filet de securite de `down` : rattraper un moteur par son PORT.
+
+    Le fichier PID peut avoir disparu alors que le moteur vit encore. Le port
+    est alors la seule prise qui reste.
+    """
+    try:
+        port = Settings().port
+    except Exception:
+        # `down` doit marcher meme avec un .env casse : on ne peut pas exiger
+        # une configuration valide pour avoir le droit d'arreter quelque chose.
+        port = int(Settings.model_fields["port"].default)
+
+    if port_libre(port):
+        return
+
+    if liberer_port_moteur(port):
+        return
+
+    if (trouve := processus_du_port(port)) is None:
+        return
+    autre_pid, ligne = trouve
+    if est_notre_moteur(ligne):
+        print(
+            f"Le moteur (pid {autre_pid}) tient toujours le port {port} :\n"
+            f"      kill -9 {autre_pid}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            f"Le port {port} est tenu par le pid {autre_pid}, qui n'est PAS un moteur\n"
+            f"  de ce projet -- on n'y touche pas :\n      {ligne or '(commande inconnue)'}",
+            file=sys.stderr,
+        )
+
+
 def _pid_enregistre() -> int | None:
-    """Le PID note par `up`, s'il correspond a un processus encore vivant."""
+    """Le PID note par `up`, s'il correspond a un processus encore vivant.
+
+    `pid_vivant` et pas un `os.kill` local : un PermissionError signifie que le
+    processus EXISTE mais nous echappe, et le confondre avec « il n'existe
+    plus » etait l'autre moitie du bug -- la trace etait alors effacee.
+    """
     try:
         pid = int(FICHIER_PID.read_text(encoding="utf-8").strip())
     except (OSError, ValueError):
         return None
-    try:
-        os.kill(pid, 0)
-    except (ProcessLookupError, PermissionError, OSError):
-        return None
-    return pid
+    return pid if pid_vivant(pid) else None
 
 
 def _cache_huggingface() -> Path:
