@@ -112,6 +112,10 @@ def cmd_doctor(_args: argparse.Namespace) -> int:
             valeur = "(definie)" if valeur else "(vide)"
         print(f"  {champ:28s} {valeur}")
 
+    print("\nVoix")
+    for ligne in _lignes_voix(settings):
+        print(f"  {ligne}")
+
     print("\nPoids attendus en mode local")
     manquants = _modeles_manquants(settings)
     if manquants:
@@ -213,11 +217,58 @@ def _lancer(command: str) -> int:
     return 0
 
 
+def _lignes_voix(settings: Settings) -> list[str]:
+    """Comment la voix est produite. C'est devenu le reglage le plus structurant.
+
+    Sans ce bloc, il faut croiser trois lignes de « Reglages resolus » pour
+    savoir si l'on clone ou non -- et le piege qu'on veut rendre visible est
+    justement une incoherence entre le checkpoint et la reference.
+    """
+    if not settings.clonage_actif:
+        return [
+            f"{'mode':14s} locuteur predefini ({settings.type_de_modele})",
+            f"{'locuteur':14s} {settings.tts_speaker}",
+        ]
+
+    lignes = [f"{'mode':14s} clonage de voix (checkpoint Base)"]
+
+    chemin = settings.ref_audio_path
+    detail = ""
+    try:
+        import wave
+
+        with wave.open(str(chemin)) as fichier:
+            hz = fichier.getframerate()
+            duree = fichier.getnframes() / hz
+            detail = f"  [{duree:.1f} s, {hz} Hz, {fichier.getnchannels()} canal]"
+    except Exception:
+        # Un WAV illisible n'empeche pas de diagnostiquer le reste. La
+        # bibliotheque sait lire d'autres formats que `wave` : l'absence de
+        # detail n'est donc pas un defaut en soi.
+        detail = "  [duree non lue]"
+
+    lignes.append(f"{'reference':14s} {chemin}{detail}")
+    lignes.append(f"{'transcription':14s} {len(settings.ref_text)} caracteres")
+    lignes.append(f"{'locuteur':14s} (sans effet en clonage)")
+    if settings.emotions:
+        lignes.append(
+            f"{'emotions':14s} ACTIVEES, mais SANS EFFET : le chemin de clonage "
+            "ne transmet pas `instruct`"
+        )
+    else:
+        lignes.append(f"{'emotions':14s} desactivees (incompatibles avec le clonage)")
+    return lignes
+
+
 def _modeles_manquants(settings: Settings) -> list[str]:
     """Affiche l'etat de chaque depot de poids et renvoie les manquants."""
     from huggingface_hub.constants import HF_HUB_CACHE
 
     attendus = dict(MODELES_LOCAUX)
+    # La synthese est un REGLAGE depuis l'arrivee du clonage : verifier le
+    # modele fige de MODELES_LOCAUX ferait mentir `doctor` des que quelqu'un
+    # change VOICE_TTS_MODEL.
+    attendus["synthese"] = settings.tts_model
     if settings.llm_mode == "local":
         attendus["langue"] = settings.llm_model
 
