@@ -14,8 +14,8 @@ et y ajoute deux choses qu'elle ne sait pas faire :
 - **une voix française clonée**, parce qu'aucun des neuf locuteurs prédéfinis du modèle
   n'est natif du français.
 
-Le dépôt fait environ 1 800 lignes de Python largement commenté, plus 1 300 lignes de tests
-(101 tests, moins d'une seconde, aucun modèle chargé). Tout le reste — détection de parole,
+Le dépôt fait environ 2 100 lignes de Python largement commenté, plus 1 600 lignes de tests
+(125 tests, moins d'une seconde, aucun modèle chargé). Tout le reste — détection de parole,
 transcription, modèle de langue, synthèse, protocole temps réel — vient de la bibliothèque.
 
 ## La pile
@@ -269,13 +269,15 @@ amont. La liste des contrôles à faire est dans [docs/DOCKER.md](docs/DOCKER.md
 | `aucune etiquette d'emotion` | Idem | Même chose |
 | `Ignoring options for inactive backends` | Un drapeau mal nommé | `uv run assistant-vocal doctor` et `uv run pytest` |
 | `it is recommended to use mlx-lm` | Faux positif en mode API | À ignorer : la transcription et la synthèse restent bien sur le GPU |
-| Le port 8765 ou 7860 est pris | Une instance traîne | `uv run assistant-vocal down` — et non `docker compose down`, qui ne touche pas aux services derrière un profil |
+| Le port 8765 est pris par un moteur du projet | Un `up` interrompu brutalement a laissé un orphelin | Rien à faire : `up` le reprend tout seul. `down` aussi, même sans fichier PID — il retrouve le moteur **par son port** |
+| Le port 8765 est pris par autre chose | Un vrai conflit | `up` refuse et **nomme le processus** : arrêtez-le, ou `VOICE_PORT=8766 uv run assistant-vocal up` |
+| Le port 7860 est pris | Un conteneur traîne | `uv run assistant-vocal down` — et non `docker compose down`, qui ne touche pas aux services derrière un profil |
 | `dial unix ... docker.sock` | Le daemon Docker est arrêté | Ouvrir Docker Desktop, ou `open -a Docker` |
 
 ## Développement
 
 ```bash
-make test     # 101 tests, aucun modele charge, moins d'une seconde
+make test     # 125 tests, aucun modele charge, moins d'une seconde
 make lint     # ruff : lint et formatage
 make check    # tout, plus la validation des deux profils compose
 ```
